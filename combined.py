@@ -130,16 +130,30 @@ bot = Client(
 @bot.on_message(filters.private & filters.text)
 async def handle_private_message(client: Client, message: Message):
     """Handle incoming private messages."""
-    logger.info(f"Message from {message.from_user.id}: {message.text[:50]}")
+    logger.info(f"Message from {message.from_user.id} (@{message.from_user.username}): {message.text[:50]}")
     # TODO: Route to the correct web user via Redis session mapping
     # For now, echo back
     await message.reply_text(f"Received: {message.text[:100]}")
+
+
+@bot.on_message(filters.command("start"))
+async def handle_start(client: Client, message: Message):
+    """Handle /start command."""
+    logger.info(f"/start from {message.from_user.id} (@{message.from_user.username})")
+    me = await client.get_me()
+    await message.reply_text(
+        f"👋 Hello! I'm @{me.username}\n\n"
+        f"Send me any message and I'll echo it back.\n"
+        f"Use the dashboard to submit OTPs."
+    )
 
 
 # ----------------------------------------------------------------- Runner ---
 async def main():
     logger.info("Starting Pyrogram userbot...")
     await bot.start()
+    me = await bot.get_me()
+    logger.info(f"Logged in as @{me.username} (id={me.id}, is_bot={me.is_bot})")
     logger.info("Userbot connected! Starting web server...")
     server = uvicorn.Server(
         uvicorn.Config(
