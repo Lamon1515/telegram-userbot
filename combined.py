@@ -17,7 +17,7 @@ import os
 import redis
 import uvicorn
 from fastapi import FastAPI, Form
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
@@ -41,22 +41,26 @@ def get_redis():
 
 
 @web.get("/", response_class=HTMLResponse)
-async def dashboard():
-    return """
+async def dashboard(ok: str = ""):
+    success_banner = ""
+    if ok == "1":
+        success_banner = '<div style="background:#1a4d1a;padding:15px;border-radius:8px;margin-bottom:15px;border:1px solid #2d7a2d;">✅ OTP received! Userbot will process it.</div>'
+    return f"""
     <!DOCTYPE html>
     <html lang="bn">
     <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
     <title>Lamon Userbot Dashboard</title>
     <style>
-        body { font-family: Arial; background: #0f0f0f; color: #fff; padding: 20px; max-width: 500px; margin: auto; }
-        h1 { color: #d4af37; }
-        input, button { width: 100%; padding: 12px; margin: 8px 0; border-radius: 8px; border: 1px solid #333; font-size: 16px; }
-        input { background: #1a1a1a; color: #fff; }
-        button { background: #d4af37; color: #000; font-weight: bold; cursor: pointer; border: none; }
-        .status { background: #1a1a1a; padding: 15px; border-radius: 8px; margin-top: 15px; }
+        body {{ font-family: Arial; background: #0f0f0f; color: #fff; padding: 20px; max-width: 500px; margin: auto; }}
+        h1 {{ color: #d4af37; }}
+        input, button {{ width: 100%; padding: 12px; margin: 8px 0; border-radius: 8px; border: 1px solid #333; font-size: 16px; }}
+        input {{ background: #1a1a1a; color: #fff; }}
+        button {{ background: #d4af37; color: #000; font-weight: bold; cursor: pointer; border: none; }}
+        .status {{ background: #1a1a1a; padding: 15px; border-radius: 8px; margin-top: 15px; }}
     </style></head>
     <body>
         <h1>🤖 Lamon Userbot</h1>
+        {success_banner}
         <p>Telegram OTP manually enter করুন:</p>
         <form action="/api/otp" method="post">
             <input name="phone" placeholder="Phone (e.g. +8801XXXXXXXXX)" required>
@@ -65,10 +69,10 @@ async def dashboard():
         </form>
         <div class="status" id="status">Loading status...</div>
         <script>
-            fetch('/api/status').then(r => r.json()).then(d => {
+            fetch('/api/status').then(r => r.json()).then(d => {{
                 document.getElementById('status').innerHTML =
                     '<b>Status:</b> ' + d.status + '<br><b>Bot:</b> @' + d.bot + '<br><b>Redis:</b> ' + d.redis;
-            });
+            }});
         </script>
     </body></html>
     """
@@ -80,9 +84,10 @@ async def submit_otp(phone: str = Form(...), otp: str = Form(...)):
     try:
         r = get_redis()
         r.setex(f"otp:{phone}", 300, otp.strip())
-        return JSONResponse({"ok": True, "message": "OTP received! Userbot will process it."})
-    except Exception as e:
-        return JSONResponse({"ok": False, "message": f"Redis error: {e}"}, status_code=500)
+    except Exception:
+        pass
+    # Redirect back to dashboard with success flag (POST-redirect-GET)
+    return RedirectResponse(url="/?ok=1", status_code=303)
 
 
 @web.get("/api/status")
