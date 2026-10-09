@@ -12,6 +12,7 @@ Endpoints:
 """
 import asyncio
 import logging
+import os
 
 import redis
 import uvicorn
@@ -108,10 +109,16 @@ async def health():
 
 
 # --------------------------------------------------------------- Pyrogram ---
+# Session string (for headless login) or bot token — set via env vars
+_session_string = os.getenv("SESSION_STRING", "")
+_bot_token = config.BOT_TOKEN
+
 bot = Client(
     config.SESSION_NAME,
     api_id=config.API_ID,
     api_hash=config.API_HASH,
+    session_string=_session_string or None,
+    bot_token=_bot_token or None,
 )
 
 
