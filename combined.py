@@ -373,9 +373,63 @@ async def chat_commands(bot: str = Query("")):
     return JSONResponse({"ok": True, "commands": []})
 
 
+@web.post("/api/admin/bots/discover")
+async def admin_discover_commands(bot_username: str = Form(...)):
+    """Auto-discover a bot's real commands by sending /help and /start, parsing responses."""
+    if not userbot_ready or not userbot:
+        return JSONResponse({"ok": False, "error": "Relay offline."}, status_code=503)
+    import re
+    target = norm_bot(bot_username)
+    bkey = bot_key(target)
+    # Use a dedicated discovery session so routing doesn't mix with users
+    disc_sid = "_discover"
+    r = get_redis()
+    # Clear old discovery history
+    r.delete(f"chat:history:{disc_sid}:{bkey}")
+    found = {}
+    try:
+        # Send /start and /help, collect responses
+        for cmd in ["/start", "/help"]:
+            r.rpush(f"route:pending:{bkey}", disc_sid)
+            await userbot.send_message(target, cmd)
+            await asyncio.sleep(3)  # wait for reply
+        # Read what came back
+        msgs = r.lrange(f"chat:history:{disc_sid}:{bkey}", 0, -1)
+        for mj in msgs:
+            m = json.loads(mj)
+            if m.get("from") != "bot":
+                continue
+            text = m.get("text", "")
+            # Find /commands in text
+            for cm in re.finditer(r"/(\w+)", text):
+                c = cm.group(1).lower()
+                if c not in found and c not in ("start",):
+                    found[c] = ""
+            # Also check button texts that look like commands
+            for row in m.get("buttons", []):
+                for b in row:
+                    bt = b.get("text", "")
+                    cm = re.match(r"^/(\w+)", bt)
+                    if cm and cm.group(1).lower() not in found:
+                        found[cm.group(1).lower()] = bt
+        # Always include /start
+        cmds = [{"command": "start", "description": "Start"}]
+        for c, d in sorted(found.items()):
+            cmds.append({"command": c, "description": d})
+        if len(cmds) > 1:
+            r.set(f"relay:cmds_custom:{bkey}", json.dumps(cmds))
+            logger.info(f"Discovered {len(cmds)} commands for @{bkey}: {[c['command'] for c in cmds]}")
+        # Cleanup
+        r.delete(f"chat:history:{disc_sid}:{bkey}")
+        return JSONResponse({"ok": True, "commands": cmds, "source": "discovered"})
+    except Exception as e:
+        logger.error(f"Discovery failed: {e}")
+        return JSONResponse({"ok": False, "error": str(e)[:200]}, status_code=500)
+
+
 @web.post("/api/admin/bots/commands")
 async def admin_set_commands(bot_username: str = Form(...), commands: str = Form(...)):
-    """Admin: set custom commands for a bot (one per line: /cmd description)."""
+    """Admin: manually set custom commands for a bot (one per line: /cmd description)."""
     bkey = bot_key(bot_username)
     cmds = []
     for line in commands.strip().split("\n"):
@@ -446,12 +500,16 @@ async def dashboard(ok: str = "", otp: str = "", err: str = ""):
             <form action="/api/admin/bots/add" method="post">
                 <input name="bot_username" placeholder="@BotUsername" required>
                 <button type="submit">➕ Add Bot</button></form></div>
-        <div class="card"><h3>📋 Custom Commands per Bot</h3>
-            <p style="font-size:13px;color:#888;">Bot-এর command auto না আসলে এখানে manually দাও (প্রতি লাইনে একটা: /command বিবরণ)</p>
+        <div class="card"><h3>📋 Bot Commands</h3>
+            <p style="font-size:13px;color:#888;">🔍 Auto-discover: bot-কে /start + /help পাঠিয়ে আসল commands বের করে আনবে!</p>
+            <form action="/api/admin/bots/discover" method="post">
+                <input name="bot_username" placeholder="@BotUsername" required>
+                <button type="submit">🔍 Auto-Discover Commands</button></form>
+            <p style="font-size:13px;color:#888;margin-top:10px;">✋ Manual: প্রতি লাইনে একটা (যেমন: /command বিবরণ)</p>
             <form action="/api/admin/bots/commands" method="post">
                 <input name="bot_username" placeholder="@BotUsername" required>
-                <textarea name="commands" placeholder="/start Start&#10;/deposit Deposit&#10;/withdraw Withdraw" rows="4" style="width:100%;padding:12px;margin:8px 0;border-radius:8px;border:1px solid #333;background:#222;color:#fff;font-size:14px;box-sizing:border-box;"></textarea>
-                <button type="submit">💾 Save Commands</button></form></div>
+                <textarea name="commands" placeholder="/start Start&#10;/deposit Deposit" rows="3" style="width:100%;padding:12px;margin:8px 0;border-radius:8px;border:1px solid #333;background:#222;color:#fff;font-size:14px;box-sizing:border-box;"></textarea>
+                <button type="submit">💾 Save Manual</button></form></div>
         <div class="card"><a href="/chat">💬 Open Live Chat →</a></div>
         <div class="card"><a href="/api/status">📊 Status</a></div>
     </body></html>
