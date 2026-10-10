@@ -184,10 +184,14 @@ async def route_bot_message(message: Message, edited: bool = False):
         return
     r.setex(f"route:seen:{bkey}:{mid}", 86400, "1")
 
-    # --- find target session: front of pending queue for this bot ---
-    target_sid = r.lpop(f"route:pending:{bkey}")
+    # --- find target session: lock holder first, then pending queue ---
+    LOCK_TTL = 120
+    target_sid = r.get(f"lock:{bkey}")
+    if target_sid:
+        r.expire(f"lock:{bkey}", LOCK_TTL)  # refresh on activity
+    else:
+        target_sid = r.lpop(f"route:pending:{bkey}")
     if not target_sid:
-        # Nobody waiting — broadcast to sessions with recent activity? No: drop to admin log
         logger.info(f"[Route] No pending user for @{bkey}, storing in orphan")
         target_sid = "_orphan"
 
@@ -207,7 +211,7 @@ async def make_buttons(r, session_id, bkey, mid, message):
                     b["cb_id"] = cb_id
                     r.setex(f"cb:{cb_id}", 3600, json.dumps({
                         "session": session_id, "chat_id": message.chat.id,
-                        "msg_id": mid, "data": btn.callback_data,
+                        "msg_id": mid, "data": btn.callback_data, "bkey": bkey,
                     }))
                     brow.append(b)
                 elif getattr(btn, "url", None):
@@ -288,6 +292,21 @@ async def chat_send(session_id: str = Form(...), bot: str = Form(...), text: str
         bkey = bot_key(target)
         hkey = f"chat:history:{session_id}:{bkey}"
         t = text[:500]
+        LOCK_TTL = 120
+        # --- Conversation lock: one user talks to the bot at a time ---
+        lock_holder = r.get(f"lock:{bkey}")
+        if lock_holder and lock_holder != session_id:
+            # Bot is busy with another user — queue this message
+            r.rpush(f"queue:{bkey}", json.dumps({
+                "session": session_id, "text": t, "ts": time.time()}))
+            r.rpush(hkey, json.dumps({"from": "user", "text": t, "ts": time.time(), "queued": True}))
+            r.ltrim(hkey, -200, -1)
+            qpos = r.llen(f"queue:{bkey}")
+            logger.info(f"[Queue:{session_id[:8]}] @{bkey} busy, queued at #{qpos}")
+            return JSONResponse({"ok": True, "queued": True,
+                                 "message": f"Bot is busy with another user. You are #{qpos} in queue."})
+        # Acquire/refresh lock
+        r.setex(f"lock:{bkey}", LOCK_TTL, session_id)
         # Auto /start so default/welcome messages show
         if r.llen(hkey) == 0 and not t.strip().startswith("/"):
             await userbot.send_message(target, "/start")
@@ -296,7 +315,6 @@ async def chat_send(session_id: str = Form(...), bot: str = Form(...), text: str
             await asyncio.sleep(1)
         r.rpush(hkey, json.dumps({"from": "user", "text": t, "ts": time.time()}))
         r.ltrim(hkey, -200, -1)
-        # Mark this user as awaiting reply (FIFO)
         r.rpush(f"route:pending:{bkey}", session_id)
         r.expire(f"route:pending:{bkey}", 300)
         await userbot.send_message(target, t)
@@ -305,6 +323,41 @@ async def chat_send(session_id: str = Form(...), bot: str = Form(...), text: str
     except Exception as e:
         logger.error(f"Send failed: {e}")
         return JSONResponse({"ok": False, "error": str(e)[:200]}, status_code=500)
+
+
+async def queue_processor():
+    """Background task: when a bot's lock expires, send the next queued message."""
+    LOCK_TTL = 120
+    while True:
+        try:
+            await asyncio.sleep(10)
+            if not userbot_ready or not userbot:
+                continue
+            r = get_redis()
+            for b in get_bots():
+                bkey = bot_key(b)
+                if r.get(f"lock:{bkey}"):
+                    continue  # still locked
+                qitem = r.lpop(f"queue:{bkey}")
+                if not qitem:
+                    continue
+                q = json.loads(qitem)
+                sid, t = q["session"], q["text"]
+                hkey = f"chat:history:{sid}:{bkey}"
+                try:
+                    r.setex(f"lock:{bkey}", LOCK_TTL, sid)
+                    await userbot.send_message(norm_bot(b), t)
+                    r.rpush(f"route:pending:{bkey}", sid)
+                    # Mark as sent (update the queued marker)
+                    logger.info(f"[Queue] Sent queued msg for {sid[:8]} -> @{bkey}")
+                except Exception as e:
+                    logger.error(f"[Queue] Failed to send for {sid[:8]}: {e}")
+                    r.delete(f"lock:{bkey}")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"Queue processor error: {e}")
+            await asyncio.sleep(10)
 
 
 @web.get("/api/chat/messages")
@@ -332,8 +385,11 @@ async def chat_callback(session_id: str = Form(...), cb_id: str = Form(...)):
             return JSONResponse({"ok": False, "error": "Not yours."}, status_code=403)
         await userbot.request_callback_answer(
             chat_id=cb["chat_id"], message_id=cb["msg_id"], callback_data=cb["data"])
-        # The reply to this click goes to the clicker
-        # (find bot from chat_id -> need mapping; use pending queue trick)
+        # Route the click's reply to the clicker: acquire lock + pending
+        bkey = cb.get("bkey", "")
+        if bkey:
+            r.setex(f"lock:{bkey}", 120, session_id)
+            r.rpush(f"route:pending:{bkey}", session_id)
         logger.info(f"[Click:{session_id[:8]}] {cb['data'][:40]}")
         return JSONResponse({"ok": True})
     except Exception as e:
@@ -746,9 +802,12 @@ async def chat_ui():
                 const t = inp.value.trim();
                 if (!t || !curBot) return;
                 inp.value = '';
-                await fetch('/api/chat/send', {method:'POST',
+                const r = await fetch('/api/chat/send', {method:'POST',
                     headers:{'Content-Type':'application/x-www-form-urlencoded'},
-                    body:'session_id='+sid+'&bot='+encodeURIComponent(curBot)+'&text='+encodeURIComponent(t)});
+                    body:'session_id='+sid+'&bot='+encodeURIComponent(curBot)+'&text='+encodeURIComponent(t)}).then(x=>x.json());
+                if (r.queued) {
+                    document.getElementById('status').textContent = '⏳ ' + r.message;
+                }
                 setTimeout(poll, 800);
             }
             async function clickBtn(cb_id, btn) {
@@ -850,6 +909,7 @@ async def main():
     me = await bot.get_me()
     logger.info(f"Bot @{me.username} online")
     asyncio.create_task(bot_api_poller())
+    asyncio.create_task(queue_processor())
     await init_userbot()
     logger.info("Starting web server...")
     server = uvicorn.Server(uvicorn.Config(web, host=config.WEB_HOST, port=config.WEB_PORT, log_level="info"))
