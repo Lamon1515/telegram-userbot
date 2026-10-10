@@ -90,19 +90,42 @@ async def init_userbot():
 
         @userbot.on_message(filters.chat(TARGET_BOT.strip("@")))
         async def handle_target_reply(client, message: Message):
-            """When @FastDpHouseBot replies, store for web UI."""
+            """When @FastDpHouseBot replies, store for web UI (with buttons)."""
             text = message.text or message.caption or "[media]"
             logger.info(f"[Relay] Reply from {TARGET_BOT}: {text[:80]}")
+            # Extract inline keyboard buttons
+            buttons = []
+            if message.reply_markup and hasattr(message.reply_markup, "inline_keyboard"):
+                for row in message.reply_markup.inline_keyboard:
+                    brow = []
+                    for btn in row:
+                        b = {"text": btn.text}
+                        if btn.callback_data:
+                            b["callback"] = btn.callback_data
+                            # Store mapping for callback handling
+                            cb_id = f"{message.id}:{btn.callback_data[:50]}"
+                            brow.append({**b, "cb_id": cb_id})
+                            r0 = get_redis()
+                            r0.setex(f"cb:{cb_id}", 3600, json.dumps({
+                                "chat_id": message.chat.id,
+                                "msg_id": message.id,
+                                "data": btn.callback_data,
+                            }))
+                        elif btn.url:
+                            b["url"] = btn.url
+                            brow.append(b)
+                    if brow:
+                        buttons.append(brow)
             r = get_redis()
-            # Store in chat history
             msg_data = json.dumps({
                 "from": "bot",
                 "text": text,
                 "ts": time.time(),
+                "buttons": buttons,
+                "msg_id": message.id,
             })
             r.rpush("chat:history", msg_data)
-            r.ltrim("chat:history", -100, -1)  # Keep last 100
-            # Notify web UI via pub/sub
+            r.ltrim("chat:history", -100, -1)
             r.publish("chat:updates", msg_data)
 
     except Exception as e:
@@ -157,6 +180,30 @@ async def chat_status():
         "relay_ready": userbot_ready,
         "target": TARGET_BOT,
     })
+
+
+@web.post("/api/chat/callback")
+async def chat_callback(cb_id: str = Form(...)):
+    """Web user clicked an inline button -> trigger callback on @FastDpHouseBot."""
+    if not userbot_ready or not userbot:
+        return JSONResponse({"ok": False, "error": "Userbot not connected."}, status_code=503)
+    try:
+        r = get_redis()
+        cb_json = r.get(f"cb:{cb_id}")
+        if not cb_json:
+            return JSONResponse({"ok": False, "error": "Button expired. Ask the bot again."}, status_code=400)
+        cb = json.loads(cb_json)
+        # Use Pyrogram to click the button via callback query
+        await userbot.request_callback_answer(
+            chat_id=cb["chat_id"],
+            message_id=cb["msg_id"],
+            callback_data=cb["data"],
+        )
+        logger.info(f"[Relay] Button clicked: {cb['data'][:50]}")
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        logger.error(f"Callback failed: {e}")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
 # ------------------------------------------------------------ Session setup -
@@ -272,6 +319,9 @@ async def chat_ui():
         .msg { max-width: 80%; padding: 10px 14px; border-radius: 12px; word-wrap: break-word; }
         .msg.user { align-self: flex-end; background: #d4af37; color: #000; }
         .msg.bot { align-self: flex-start; background: #222; border: 1px solid #333; }
+        .btnrow { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+        .tbtn { padding: 8px 12px; border-radius: 8px; border: 1px solid #d4af37; background: transparent; color: #d4af37; cursor: pointer; font-size: 14px; }
+        .tbtn:active { background: #d4af37; color: #000; }
         #inputbar { display: flex; padding: 10px; gap: 8px; background: #1a1a1a; border-top: 1px solid #333; }
         #inputbar input { flex: 1; padding: 12px; border-radius: 8px; border: 1px solid #333; background: #222; color: #fff; font-size: 16px; }
         #inputbar button { padding: 12px 20px; border-radius: 8px; border: none; background: #d4af37; color: #000; font-weight: bold; cursor: pointer; }
@@ -299,6 +349,25 @@ async def chat_ui():
                             const div = document.createElement('div');
                             div.className = 'msg ' + m.from;
                             div.textContent = m.text;
+                            // Render inline buttons
+                            if (m.buttons && m.buttons.length) {
+                                m.buttons.forEach(row => {
+                                    const rdiv = document.createElement('div');
+                                    rdiv.className = 'btnrow';
+                                    row.forEach(b => {
+                                        const btn = document.createElement('button');
+                                        btn.className = 'tbtn';
+                                        btn.textContent = b.text;
+                                        if (b.url) {
+                                            btn.onclick = () => window.open(b.url, '_blank');
+                                        } else if (b.cb_id) {
+                                            btn.onclick = () => clickBtn(b.cb_id, btn);
+                                        }
+                                        rdiv.appendChild(btn);
+                                    });
+                                    div.appendChild(rdiv);
+                                });
+                            }
                             box.appendChild(div);
                         });
                         box.scrollTop = box.scrollHeight;
@@ -320,6 +389,15 @@ async def chat_ui():
                 poll();
             }
             document.getElementById('inp').addEventListener('keypress', e => { if (e.key === 'Enter') send(); });
+            async function clickBtn(cb_id, btn) {
+                btn.disabled = true; btn.textContent += '...';
+                await fetch('/api/chat/callback', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                    body: 'cb_id=' + encodeURIComponent(cb_id)
+                });
+                setTimeout(poll, 1500);
+            }
             setInterval(poll, 2000); poll();
         </script>
     </body></html>
