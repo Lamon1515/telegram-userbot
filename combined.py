@@ -171,6 +171,7 @@ async def route_bot_message(message: Message, edited: bool = False):
                 if m.get("msg_id") == mid and m.get("from") == "bot":
                     m["text"] = text
                     m["edited"] = True
+                    m["ts"] = time.time()  # bump ts so poll picks up the edit
                     # refresh buttons for this session
                     m["buttons"] = await make_buttons(r, skey.split(":")[2], bkey, mid, message)
                     r.lset(skey, i, json.dumps(m))
@@ -343,22 +344,51 @@ async def chat_callback(session_id: str = Form(...), cb_id: str = Form(...)):
 async def chat_commands(bot: str = Query("")):
     if not userbot_ready or not userbot:
         return JSONResponse({"ok": True, "commands": []})
+    bkey = bot_key(bot)
+    # 1. Custom admin-configured commands first
+    try:
+        custom = get_redis().get(f"relay:cmds_custom:{bkey}")
+        if custom:
+            return JSONResponse({"ok": True, "commands": json.loads(custom), "source": "custom"})
+    except Exception:
+        pass
+    # 2. Auto-fetch from Telegram
     try:
         from pyrogram import raw
         target = norm_bot(bot)
         peer = await userbot.resolve_peer(target)
         result = await userbot.invoke(raw.functions.bots.GetBotCommands(bot=peer))
         cmds = [{"command": c.command, "description": c.description} for c in result]
-        get_redis().setex(f"relay:cmds:{bot_key(target)}", 3600, json.dumps(cmds))
-        return JSONResponse({"ok": True, "commands": cmds})
+        if cmds:
+            get_redis().setex(f"relay:cmds:{bkey}", 3600, json.dumps(cmds))
+            return JSONResponse({"ok": True, "commands": cmds, "source": "auto"})
+    except Exception as e:
+        logger.warning(f"GetBotCommands failed for {bot}: {e}")
+    try:
+        cached = get_redis().get(f"relay:cmds:{bkey}")
+        if cached:
+            return JSONResponse({"ok": True, "commands": json.loads(cached), "cached": True})
     except Exception:
-        try:
-            cached = get_redis().get(f"relay:cmds:{bot_key(bot)}")
-            if cached:
-                return JSONResponse({"ok": True, "commands": json.loads(cached), "cached": True})
-        except Exception:
-            pass
-        return JSONResponse({"ok": True, "commands": []})
+        pass
+    return JSONResponse({"ok": True, "commands": []})
+
+
+@web.post("/api/admin/bots/commands")
+async def admin_set_commands(bot_username: str = Form(...), commands: str = Form(...)):
+    """Admin: set custom commands for a bot (one per line: /cmd description)."""
+    bkey = bot_key(bot_username)
+    cmds = []
+    for line in commands.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        cmd = parts[0].lstrip("/")
+        desc = parts[1] if len(parts) > 1 else ""
+        cmds.append({"command": cmd, "description": desc})
+    get_redis().set(f"relay:cmds_custom:{bkey}", json.dumps(cmds))
+    logger.info(f"Custom commands set for @{bkey}: {len(cmds)}")
+    return RedirectResponse(url="/", status_code=303)
 
 
 @web.post("/api/admin/bots/add")
@@ -416,6 +446,12 @@ async def dashboard(ok: str = "", otp: str = "", err: str = ""):
             <form action="/api/admin/bots/add" method="post">
                 <input name="bot_username" placeholder="@BotUsername" required>
                 <button type="submit">➕ Add Bot</button></form></div>
+        <div class="card"><h3>📋 Custom Commands per Bot</h3>
+            <p style="font-size:13px;color:#888;">Bot-এর command auto না আসলে এখানে manually দাও (প্রতি লাইনে একটা: /command বিবরণ)</p>
+            <form action="/api/admin/bots/commands" method="post">
+                <input name="bot_username" placeholder="@BotUsername" required>
+                <textarea name="commands" placeholder="/start Start&#10;/deposit Deposit&#10;/withdraw Withdraw" rows="4" style="width:100%;padding:12px;margin:8px 0;border-radius:8px;border:1px solid #333;background:#222;color:#fff;font-size:14px;box-sizing:border-box;"></textarea>
+                <button type="submit">💾 Save Commands</button></form></div>
         <div class="card"><a href="/chat">💬 Open Live Chat →</a></div>
         <div class="card"><a href="/api/status">📊 Status</a></div>
     </body></html>
@@ -432,9 +468,11 @@ async def chat_ui():
         body { font-family: Arial; background: #0f0f0f; color: #fff; height: 100vh; display: flex; flex-direction: column; }
         #header { background: #1a1a1a; padding: 12px; text-align: center; border-bottom: 1px solid #333; }
         #header b { color: #d4af37; }
-        #bottabs { display: flex; gap: 6px; padding: 8px; background: #141414; overflow-x: auto; border-bottom: 1px solid #333; }
-        .btab { padding: 8px 14px; border-radius: 20px; border: 1px solid #444; background: transparent; color: #aaa; cursor: pointer; white-space: nowrap; font-size: 14px; }
-        .btab.active { border-color: #d4af37; color: #d4af37; }
+        #bottabs { display: flex; gap: 6px; padding: 10px; background: #141414; overflow-x: auto; border-bottom: 1px solid #333; }
+        .btab { padding: 10px 16px; border-radius: 12px; border: 1px solid #444; background: #1a1a1a; color: #aaa; cursor: pointer; white-space: nowrap; font-size: 14px; font-weight: bold; }
+        .btab.active { border-color: #d4af37; color: #d4af37; background: #2a2410; }
+        .btab .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #4a4a4a; margin-right: 6px; }
+        .btab.active .dot { background: #4caf50; }
         #status { text-align: center; padding: 6px; font-size: 12px; color: #888; }
         #cmdbar { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px; background: #141414; border-bottom: 1px solid #333; }
         #messages { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
@@ -470,14 +508,16 @@ async def chat_ui():
                 (d.bots||[]).forEach((b,i) => {
                     const t = document.createElement('button');
                     t.className = 'btab' + (i===0?' active':'');
-                    t.textContent = b; t.onclick = () => switchBot(b);
+                    t.innerHTML = '<span class="dot"></span>' + b;
+                    t.onclick = () => switchBot(b);
+                    t.dataset.bot = b;
                     tabs.appendChild(t);
                 });
                 if (d.bots && d.bots.length) switchBot(d.bots[0]);
             }
             function switchBot(b) {
                 curBot = b; lastTs = 0; box.innerHTML = '';
-                document.querySelectorAll('.btab').forEach(t=>t.classList.toggle('active', t.textContent===b));
+                document.querySelectorAll('.btab').forEach(t=>t.classList.toggle('active', t.dataset.bot===b));
                 loadCommands(); poll();
             }
             async function loadCommands() {
@@ -502,7 +542,13 @@ async def chat_ui():
                     if (d.ok && d.messages.length) {
                         d.messages.forEach(m => {
                             lastTs = Math.max(lastTs, m.ts);
-                            const div = document.createElement('div');
+                            const mid = 'm' + (m.msg_id || m.ts);
+                            let div = document.getElementById(mid);
+                            const isNew = !div;
+                            if (isNew) {
+                                div = document.createElement('div');
+                                div.id = mid;
+                            }
                             div.className = 'msg ' + m.from;
                             div.textContent = m.text + (m.edited ? ' (edited)' : '');
                             if (m.buttons && m.buttons.length) {
@@ -518,7 +564,7 @@ async def chat_ui():
                                     div.appendChild(rd);
                                 });
                             }
-                            box.appendChild(div);
+                            if (isNew) box.appendChild(div);
                         });
                         box.scrollTop = box.scrollHeight;
                     }
