@@ -91,11 +91,26 @@ async def init_userbot():
     if userbot_ready and userbot:
         return
     ss = os.getenv("SESSION_STRING", "")
+    r = get_redis()
     if not ss:
         try:
-            ss = get_redis().get("relay:master_session") or ""
-        except Exception:
-            pass
+            # Try keys in order: new -> v1 -> any per-user session (migrate)
+            ss = r.get("relay:master_session") or ""
+            if not ss:
+                ss = r.get("relay:session_string") or ""
+                if ss:
+                    logger.info("Migrating v1 session to master_session")
+                    r.set("relay:master_session", ss)
+            if not ss:
+                # Fallback: use any existing per-user session as master
+                for key in r.scan_iter("relay:session:*"):
+                    ss = r.get(key) or ""
+                    if ss:
+                        logger.info(f"Migrating {key} to master_session")
+                        r.set("relay:master_session", ss)
+                        break
+        except Exception as e:
+            logger.warning(f"Session lookup failed: {e}")
     if not ss:
         logger.info("No master session — relay disabled")
         return
