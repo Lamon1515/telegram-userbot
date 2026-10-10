@@ -70,9 +70,18 @@ userbot_ready = False
 
 
 async def init_userbot():
-    """Initialize userbot if session string is available."""
+    """Initialize userbot if session string is available (env or Redis)."""
     global userbot, userbot_ready
     ss = os.getenv("SESSION_STRING", "")
+    if not ss:
+        # Try Redis (persisted from dashboard login)
+        try:
+            r = get_redis()
+            ss = r.get("relay:session_string") or ""
+            if ss:
+                logger.info("Loaded SESSION_STRING from Redis")
+        except Exception:
+            pass
     if not ss:
         logger.info("No SESSION_STRING — userbot relay disabled")
         return
@@ -87,46 +96,75 @@ async def init_userbot():
         me = await userbot.get_me()
         logger.info(f"Relay userbot logged in as @{me.username} (id={me.id})")
         userbot_ready = True
+        # Track processed message IDs for dedup
+        _seen_ids = set()
 
-        @userbot.on_message(filters.chat(TARGET_BOT.strip("@")))
-        async def handle_target_reply(client, message: Message):
-            """When @FastDpHouseBot replies, store for web UI (with buttons)."""
+        def get_target():
+            try:
+                return get_redis().get("relay:target_bot") or TARGET_BOT
+            except Exception:
+                return TARGET_BOT
+
+        async def store_bot_message(message: Message, edited: bool = False):
+            """Store a bot message (new or edited) for the web UI."""
+            mid = message.id
+            if not edited and mid in _seen_ids:
+                return  # dedup
+            _seen_ids.add(mid)
             text = message.text or message.caption or "[media]"
-            logger.info(f"[Relay] Reply from {TARGET_BOT}: {text[:80]}")
-            # Extract inline keyboard buttons
+            logger.info(f"[Relay] {'Edited' if edited else 'Reply'} from {get_target()}: {text[:80]}")
             buttons = []
             if message.reply_markup and hasattr(message.reply_markup, "inline_keyboard"):
                 for row in message.reply_markup.inline_keyboard:
                     brow = []
                     for btn in row:
                         b = {"text": btn.text}
-                        if btn.callback_data:
-                            b["callback"] = btn.callback_data
-                            # Store mapping for callback handling
-                            cb_id = f"{message.id}:{btn.callback_data[:50]}"
+                        if getattr(btn, "callback_data", None):
+                            cb_id = f"{mid}:{btn.callback_data[:50]}"
                             brow.append({**b, "cb_id": cb_id})
                             r0 = get_redis()
                             r0.setex(f"cb:{cb_id}", 3600, json.dumps({
                                 "chat_id": message.chat.id,
-                                "msg_id": message.id,
+                                "msg_id": mid,
                                 "data": btn.callback_data,
                             }))
-                        elif btn.url:
+                        elif getattr(btn, "url", None):
                             b["url"] = btn.url
                             brow.append(b)
                     if brow:
                         buttons.append(brow)
             r = get_redis()
-            msg_data = json.dumps({
-                "from": "bot",
-                "text": text,
-                "ts": time.time(),
-                "buttons": buttons,
-                "msg_id": message.id,
-            })
-            r.rpush("chat:history", msg_data)
-            r.ltrim("chat:history", -100, -1)
-            r.publish("chat:updates", msg_data)
+            if edited:
+                # Update the existing message in history
+                all_msgs = r.lrange("chat:history", 0, -1)
+                for i, mjson in enumerate(all_msgs):
+                    m = json.loads(mjson)
+                    if m.get("msg_id") == mid and m.get("from") == "bot":
+                        m["text"] = text
+                        m["buttons"] = buttons
+                        m["edited"] = True
+                        r.lset("chat:history", i, json.dumps(m))
+                        r.publish("chat:updates", json.dumps({**m, "type": "edit"}))
+                        break
+            else:
+                msg_data = json.dumps({
+                    "from": "bot",
+                    "text": text,
+                    "ts": time.time(),
+                    "buttons": buttons,
+                    "msg_id": mid,
+                })
+                r.rpush("chat:history", msg_data)
+                r.ltrim("chat:history", -100, -1)
+                r.publish("chat:updates", msg_data)
+
+        @userbot.on_message(filters.chat(get_target().strip("@")))
+        async def handle_target_reply(client, message: Message):
+            await store_bot_message(message)
+
+        @userbot.on_edited_message(filters.chat(get_target().strip("@")))
+        async def handle_target_edit(client, message: Message):
+            await store_bot_message(message, edited=True)
 
     except Exception as e:
         logger.error(f"Userbot init failed: {e}")
@@ -175,11 +213,55 @@ async def chat_messages(since: float = Query(0)):
 @web.get("/api/chat/status")
 async def chat_status():
     """Check if the relay userbot is ready."""
+    try:
+        target = get_redis().get("relay:target_bot") or TARGET_BOT
+    except Exception:
+        target = TARGET_BOT
     return JSONResponse({
         "ok": True,
         "relay_ready": userbot_ready,
-        "target": TARGET_BOT,
+        "target": target,
     })
+
+
+@web.get("/api/chat/commands")
+async def chat_commands():
+    """Get the target bot's command list (auto-discovered)."""
+    if not userbot_ready or not userbot:
+        return JSONResponse({"ok": False, "error": "Userbot not connected."}, status_code=503)
+    try:
+        from pyrogram import raw
+        target = get_redis().get("relay:target_bot") or TARGET_BOT
+        peer = await userbot.resolve_peer(target)
+        result = await userbot.invoke(
+            raw.functions.bots.GetBotCommands(bot=peer)
+        )
+        cmds = [{"command": c.command, "description": c.description} for c in result]
+        # Cache for 1 hour
+        get_redis().setex("relay:bot_commands", 3600, json.dumps(cmds))
+        return JSONResponse({"ok": True, "commands": cmds})
+    except Exception as e:
+        # Fallback to cached
+        try:
+            cached = get_redis().get("relay:bot_commands")
+            if cached:
+                return JSONResponse({"ok": True, "commands": json.loads(cached), "cached": True})
+        except Exception:
+            pass
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@web.post("/api/chat/target")
+async def chat_set_target(bot_username: str = Form(...)):
+    """Change the target bot (for adding more bots)."""
+    bu = bot_username.strip()
+    if not bu.startswith("@"):
+        bu = "@" + bu
+    get_redis().set("relay:target_bot", bu)
+    # Clear history for new bot
+    get_redis().delete("chat:history")
+    logger.info(f"Target bot changed to {bu}")
+    return JSONResponse({"ok": True, "target": bu})
 
 
 @web.post("/api/chat/callback")
@@ -248,6 +330,12 @@ async def session_verify(code: str = Form(...)):
         await tmp.disconnect()
         _pending_auth.clear()
         os.environ["SESSION_STRING"] = ss
+        # Persist in Redis so redeploys don't need re-login
+        try:
+            get_redis().set("relay:session_string", ss)
+            logger.info("Session string saved to Redis (persistent)")
+        except Exception as e:
+            logger.warning(f"Could not save session to Redis: {e}")
         logger.info("Session string generated!")
         await init_userbot()
         if userbot_ready:
@@ -298,7 +386,16 @@ async def dashboard(ok: str = "", otp: str = "", err: str = ""):
             </form>
         </div>
         <div class="card"><a href="/chat">💬 Open Live Chat →</a></div>
+        <div class="card">
+            <h3>🤖 Target Bot</h3>
+            <p>Current: <b id="curbot">loading...</b></p>
+            <form action="/api/chat/target" method="post" onsubmit="setTimeout(()=>location.reload(),500)">
+                <input name="bot_username" placeholder="@NewBotUsername">
+                <button type="submit">Switch Bot</button>
+            </form>
+        </div>
         <div class="card"><a href="/api/status">📊 Status API</a></div>
+        <script>fetch('/api/chat/status').then(r=>r.json()).then(d=>{{document.getElementById('curbot').textContent=d.target;}});</script>
     </body></html>
     """
 
@@ -328,8 +425,9 @@ async def chat_ui():
         #status { text-align: center; padding: 6px; font-size: 12px; color: #888; }
     </style></head>
     <body>
-        <div id="header"><b>💬 Live Chat</b> with @FastDpHouseBot</div>
+        <div id="header"><b>💬 Live Chat</b> <span id="botname"></span></div>
         <div id="status">Connecting...</div>
+        <div id="cmdbar" style="display:flex;flex-wrap:wrap;gap:6px;padding:8px;background:#141414;border-bottom:1px solid #333;"></div>
         <div id="messages"></div>
         <div id="inputbar">
             <input id="inp" placeholder="Type a message..." autocomplete="off">
@@ -339,6 +437,23 @@ async def chat_ui():
             let lastTs = 0;
             const box = document.getElementById('messages');
             const status = document.getElementById('status');
+            async function loadCommands() {
+                try {
+                    const r = await fetch('/api/chat/commands');
+                    const d = await r.json();
+                    const bar = document.getElementById('cmdbar');
+                    if (d.ok && d.commands && d.commands.length) {
+                        bar.innerHTML = '';
+                        d.commands.forEach(c => {
+                            const b = document.createElement('button');
+                            b.className = 'tbtn'; b.textContent = '/' + c.command;
+                            b.title = c.description || '';
+                            b.onclick = () => { document.getElementById('inp').value = '/' + c.command; send(); };
+                            bar.appendChild(b);
+                        });
+                    } else { bar.style.display = 'none'; }
+                } catch(e) {}
+            }
             async function poll() {
                 try {
                     const r = await fetch('/api/chat/messages?since=' + lastTs);
@@ -374,6 +489,7 @@ async def chat_ui():
                     }
                     const s = await fetch('/api/chat/status').then(x => x.json());
                     status.textContent = s.relay_ready ? '🟢 Connected' : '🔴 Relay offline — admin setup needed';
+                    document.getElementById('botname').textContent = 'with ' + (s.target || '');
                 } catch(e) { status.textContent = '⚠️ Connection error'; }
             }
             async function send() {
@@ -398,7 +514,7 @@ async def chat_ui():
                 });
                 setTimeout(poll, 1500);
             }
-            setInterval(poll, 2000); poll();
+            setInterval(poll, 2000); poll(); loadCommands();
         </script>
     </body></html>
     """
