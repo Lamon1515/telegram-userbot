@@ -168,7 +168,6 @@ _pending_auth = {}
 async def session_phone(phone: str = Form(...)):
     """Step 1: Send OTP to phone for userbot login."""
     if not userbot_ready:
-        # Create a temp client for auth
         try:
             tmp = Client(
                 "auth_tmp",
@@ -178,16 +177,14 @@ async def session_phone(phone: str = Form(...)):
             )
             await tmp.connect()
             sent = await tmp.send_code(phone.strip())
-            # Store client and phone_code_hash (keep connected)
             _pending_auth["client"] = tmp
             _pending_auth["phone"] = phone.strip()
             _pending_auth["hash"] = sent.phone_code_hash
             logger.info(f"OTP sent to {phone.strip()}")
-            return JSONResponse({"ok": True, "message": "OTP sent! Enter the code."})
         except Exception as e:
             logger.error(f"Send code failed: {e}")
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-    return JSONResponse({"ok": True, "message": "Userbot already connected!"})
+            return RedirectResponse(url="/?err=" + str(e)[:100], status_code=303)
+    return RedirectResponse(url="/?otp=sent", status_code=303)
 
 
 @web.post("/api/session/verify")
@@ -195,35 +192,35 @@ async def session_verify(code: str = Form(...)):
     """Step 2: Verify OTP, generate and save session string."""
     tmp = _pending_auth.get("client")
     if not tmp:
-        return JSONResponse({"ok": False, "error": "No pending auth. Send phone first."}, status_code=400)
+        return RedirectResponse(url="/?err=no_auth", status_code=303)
     try:
         phone = _pending_auth["phone"]
         phone_hash = _pending_auth["hash"]
         await tmp.sign_in(phone, phone_hash, code.strip())
-        # Export session string
         ss = await tmp.export_session_string()
         await tmp.disconnect()
         _pending_auth.clear()
-        # Save to env (for this process) and instruct to set on Railway
         os.environ["SESSION_STRING"] = ss
         logger.info("Session string generated!")
-        # Re-init userbot with new session
         await init_userbot()
-        return JSONResponse({
-            "ok": True,
-            "message": "Login successful! Userbot connected.",
-            "session_ready": userbot_ready,
-            # Don't expose the full string in response; admin sets it via Railway
-            "hint": "Set SESSION_STRING env var on Railway with the generated value for persistence.",
-        })
+        if userbot_ready:
+            return RedirectResponse(url="/?ok=connected", status_code=303)
+        return RedirectResponse(url="/?err=relay_failed", status_code=303)
     except Exception as e:
         logger.error(f"Verify failed: {e}")
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+        return RedirectResponse(url="/?err=" + str(e)[:100], status_code=303)
 
 
 # ------------------------------------------------------------ Dashboard -----
 @web.get("/", response_class=HTMLResponse)
-async def dashboard():
+async def dashboard(ok: str = "", otp: str = "", err: str = ""):
+    banner = ""
+    if ok == "connected":
+        banner = '<div style="background:#1a4d1a;padding:15px;border-radius:8px;margin-bottom:15px;border:1px solid #2d7a2d;">✅ Userbot connected! Relay is live.</div>'
+    elif otp == "sent":
+        banner = '<div style="background:#1a3a4d;padding:15px;border-radius:8px;margin-bottom:15px;border:1px solid #2d6a7a;">📩 OTP sent! Check Telegram and enter the code below.</div>'
+    elif err:
+        banner = f'<div style="background:#4d1a1a;padding:15px;border-radius:8px;margin-bottom:15px;border:1px solid #7a2d2d;">❌ Error: {err}</div>'
     relay = "🟢 Connected" if userbot_ready else "🔴 Not connected"
     return f"""
     <!DOCTYPE html>
@@ -238,6 +235,7 @@ async def dashboard():
     </style></head>
     <body>
         <h1>💬 Live Chat Relay</h1>
+        {banner}
         <div class="card"><b>Target:</b> {TARGET_BOT}<br><b>Relay:</b> {relay}</div>
         <div class="card">
             <h3>🔑 Userbot Login</h3>
@@ -248,7 +246,7 @@ async def dashboard():
             </form>
             <p>Step 2: Enter OTP code</p>
             <form action="/api/session/verify" method="post">
-                <input name="otp" placeholder="OTP Code" required>
+                <input name="code" placeholder="OTP Code" required>
                 <button type="submit">Verify & Connect</button>
             </form>
         </div>
