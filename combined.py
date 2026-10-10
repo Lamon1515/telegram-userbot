@@ -440,9 +440,60 @@ async def admin_set_commands(bot_username: str = Form(...), commands: str = Form
         cmd = parts[0].lstrip("/")
         desc = parts[1] if len(parts) > 1 else ""
         cmds.append({"command": cmd, "description": desc})
-    get_redis().set(f"relay:cmds_custom:{bkey}", json.dumps(cmds))
+    get_redis().set(f"relay:cmds_custom:{bkey}", json.dumps(cmds[:10]))  # max 10
     logger.info(f"Custom commands set for @{bkey}: {len(cmds)}")
     return RedirectResponse(url="/", status_code=303)
+
+
+@web.get("/api/admin/bots/commands/list")
+async def admin_list_commands(bot: str = Query("")):
+    """List current custom commands for a bot."""
+    try:
+        custom = get_redis().get(f"relay:cmds_custom:{bot_key(bot)}")
+        cmds = json.loads(custom) if custom else []
+        return JSONResponse({"ok": True, "commands": cmds})
+    except Exception:
+        return JSONResponse({"ok": True, "commands": []})
+
+
+@web.post("/api/admin/bots/commands/add")
+async def admin_add_command(bot_username: str = Form(...), command: str = Form(...), description: str = Form("")):
+    """Add a single command to a bot's list (max 10)."""
+    bkey = bot_key(bot_username)
+    r = get_redis()
+    try:
+        custom = r.get(f"relay:cmds_custom:{bkey}")
+        cmds = json.loads(custom) if custom else []
+    except Exception:
+        cmds = []
+    cmd = command.strip().lstrip("/")
+    if cmd and not any(c["command"] == cmd for c in cmds) and len(cmds) < 10:
+        cmds.append({"command": cmd, "description": description.strip()})
+        r.set(f"relay:cmds_custom:{bkey}", json.dumps(cmds))
+    return JSONResponse({"ok": True, "commands": cmds})
+
+
+@web.post("/api/admin/bots/commands/delete")
+async def admin_delete_command(bot_username: str = Form(...), command: str = Form(...)):
+    """Delete a single command from a bot's list."""
+    bkey = bot_key(bot_username)
+    r = get_redis()
+    try:
+        custom = r.get(f"relay:cmds_custom:{bkey}")
+        cmds = json.loads(custom) if custom else []
+    except Exception:
+        cmds = []
+    cmd = command.strip().lstrip("/")
+    cmds = [c for c in cmds if c["command"] != cmd]
+    r.set(f"relay:cmds_custom:{bkey}", json.dumps(cmds))
+    return JSONResponse({"ok": True, "commands": cmds})
+
+
+@web.post("/api/admin/bots/commands/clear")
+async def admin_clear_commands(bot_username: str = Form(...)):
+    """Clear all custom commands for a bot."""
+    get_redis().delete(f"relay:cmds_custom:{bot_key(bot_username)}")
+    return JSONResponse({"ok": True, "commands": []})
 
 
 @web.post("/api/admin/bots/add")
@@ -500,16 +551,77 @@ async def dashboard(ok: str = "", otp: str = "", err: str = ""):
             <form action="/api/admin/bots/add" method="post">
                 <input name="bot_username" placeholder="@BotUsername" required>
                 <button type="submit">➕ Add Bot</button></form></div>
-        <div class="card"><h3>📋 Bot Commands</h3>
-            <p style="font-size:13px;color:#888;">🔍 Auto-discover: bot-কে /start + /help পাঠিয়ে আসল commands বের করে আনবে!</p>
-            <form action="/api/admin/bots/discover" method="post">
-                <input name="bot_username" placeholder="@BotUsername" required>
-                <button type="submit">🔍 Auto-Discover Commands</button></form>
-            <p style="font-size:13px;color:#888;margin-top:10px;">✋ Manual: প্রতি লাইনে একটা (যেমন: /command বিবরণ)</p>
-            <form action="/api/admin/bots/commands" method="post">
-                <input name="bot_username" placeholder="@BotUsername" required>
-                <textarea name="commands" placeholder="/start Start&#10;/deposit Deposit" rows="3" style="width:100%;padding:12px;margin:8px 0;border-radius:8px;border:1px solid #333;background:#222;color:#fff;font-size:14px;box-sizing:border-box;"></textarea>
-                <button type="submit">💾 Save Manual</button></form></div>
+        <div class="card"><h3>📋 Bot Commands Manager</h3>
+            <p style="font-size:13px;color:#888;">Bot select করো, commands দেখো, add/delete করো (সর্বোচ্চ ১০টি)!</p>
+            <select id="cmdbot" style="width:100%;padding:12px;margin:8px 0;border-radius:8px;border:1px solid #333;background:#222;color:#fff;font-size:16px;">
+                <option value="">-- Bot select করো --</option>
+            </select>
+            <div id="cmdlist" style="margin:10px 0;"></div>
+            <div style="display:flex;gap:6px;">
+                <input id="newcmd" placeholder="/command" style="flex:1;">
+                <input id="newdesc" placeholder="বিবরণ" style="flex:2;">
+            </div>
+            <button onclick="addCmd()" style="margin-top:6px;">➕ Add Command</button>
+            <button onclick="discoverCmd()" style="background:#2a4d2a;margin-top:6px;">🔍 Auto-Discover</button>
+            <p id="cmdmsg" style="font-size:13px;color:#d4af37;"></p>
+        </div>
+        <script>
+        async function loadCmdBots() {{
+            const d = await fetch('/api/chat/bots').then(r=>r.json());
+            const sel = document.getElementById('cmdbot');
+            sel.innerHTML = '<option value="">-- Bot select করো --</option>';
+            (d.bots||[]).forEach(b=>{{
+                const o = document.createElement('option'); o.value=b; o.textContent=b; sel.appendChild(o);
+            }});
+        }}
+        async function loadCmdList() {{
+            const bot = document.getElementById('cmdbot').value;
+            const div = document.getElementById('cmdlist');
+            if (!bot) {{ div.innerHTML=''; return; }}
+            const d = await fetch('/api/admin/bots/commands/list?bot='+encodeURIComponent(bot)).then(r=>r.json());
+            div.innerHTML = '';
+            (d.commands||[]).forEach((c,i)=>{{
+                const row = document.createElement('div');
+                row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:8px;background:#222;border-radius:8px;margin:4px 0;';
+                row.innerHTML = '<b style="color:#d4af37;">/'+c.command+'</b><span style="flex:1;color:#aaa;font-size:13px;">'+(c.description||'')+'</span>';
+                const del = document.createElement('button');
+                del.textContent = '✕'; del.style.cssText = 'width:auto;padding:6px 12px;background:#5a1a1a;';
+                del.onclick = ()=>delCmd(bot, c.command);
+                row.appendChild(del); div.appendChild(row);
+            }});
+            if (!(d.commands||[]).length) div.innerHTML = '<p style="color:#888;font-size:13px;">কোনো command নাই — নিচে add করো!</p>';
+        }}
+        async function addCmd() {{
+            const bot = document.getElementById('cmdbot').value;
+            const cmd = document.getElementById('newcmd').value.trim();
+            const desc = document.getElementById('newdesc').value.trim();
+            if (!bot || !cmd) {{ document.getElementById('cmdmsg').textContent = '❌ Bot + command দাও!'; return; }}
+            const r = await fetch('/api/admin/bots/commands/add', {{method:'POST',
+                headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
+                body:'bot_username='+encodeURIComponent(bot)+'&command='+encodeURIComponent(cmd)+'&description='+encodeURIComponent(desc)}}).then(x=>x.json());
+            document.getElementById('newcmd').value=''; document.getElementById('newdesc').value='';
+            document.getElementById('cmdmsg').textContent = '✅ Added! ('+r.commands.length+'/10)';
+            loadCmdList();
+        }}
+        async function delCmd(bot, cmd) {{
+            await fetch('/api/admin/bots/commands/delete', {{method:'POST',
+                headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
+                body:'bot_username='+encodeURIComponent(bot)+'&command='+encodeURIComponent(cmd)}});
+            loadCmdList();
+        }}
+        async function discoverCmd() {{
+            const bot = document.getElementById('cmdbot').value;
+            if (!bot) return;
+            document.getElementById('cmdmsg').textContent = '🔍 Discovering...';
+            const r = await fetch('/api/admin/bots/discover', {{method:'POST',
+                headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
+                body:'bot_username='+encodeURIComponent(bot)}}).then(x=>x.json());
+            document.getElementById('cmdmsg').textContent = r.ok ? '✅ Found '+r.commands.length+' commands!' : '❌ '+r.error;
+            loadCmdList();
+        }}
+        document.getElementById('cmdbot').addEventListener('change', loadCmdList);
+        loadCmdBots();
+        </script>
         <div class="card"><a href="/chat">💬 Open Live Chat →</a></div>
         <div class="card"><a href="/api/status">📊 Status</a></div>
     </body></html>
