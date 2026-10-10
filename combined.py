@@ -79,63 +79,133 @@ def bot_key(b):
     return norm_bot(b).strip("@").lower()
 
 
-# ------------------------------------------------------------ Master userbot
+# ------------------------------------------------------------ Account pool
+# Multiple Telegram accounts: each web user gets their own account from the pool.
+# 4-5 accounts = 4-5 users chat in parallel, zero waiting!
+_pool = {}  # pool_idx -> Client
+_pool_ready = set()  # pool_idx with connected clients
+_pool_handlers = set()
+
+# Keep single-account compat
 userbot = None
 userbot_ready = False
-_handlers_done = False
 
 
-async def init_userbot():
-    """Start the ONE master userbot (session from env or Redis)."""
-    global userbot, userbot_ready, _handlers_done
-    if userbot_ready and userbot:
-        return
-    ss = os.getenv("SESSION_STRING", "")
-    r = get_redis()
-    if not ss:
-        try:
-            # Try keys in order: new -> v1 -> any per-user session (migrate)
-            ss = r.get("relay:master_session") or ""
-            if not ss:
-                ss = r.get("relay:session_string") or ""
-                if ss:
-                    logger.info("Migrating v1 session to master_session")
-                    r.set("relay:master_session", ss)
-            if not ss:
-                # Fallback: use any existing per-user session as master
-                for key in r.scan_iter("relay:session:*"):
-                    ss = r.get(key) or ""
-                    if ss:
-                        logger.info(f"Migrating {key} to master_session")
-                        r.set("relay:master_session", ss)
-                        break
-        except Exception as e:
-            logger.warning(f"Session lookup failed: {e}")
-    if not ss:
-        logger.info("No master session — relay disabled")
-        return
+def pool_size():
     try:
-        userbot = Client("master_relay", api_id=config.API_ID,
-                         api_hash=config.API_HASH, session_string=ss)
-        await userbot.start()
-        me = await userbot.get_me()
-        logger.info(f"Master userbot: @{me.username} (id={me.id})")
+        return len(get_redis().smembers("relay:pool"))
+    except Exception:
+        return 0
+
+
+async def init_pool():
+    """Start all pooled Telegram accounts."""
+    global userbot, userbot_ready
+    r = get_redis()
+    try:
+        idxs = sorted(r.smembers("relay:pool"), key=int)
+    except Exception:
+        idxs = []
+    # Migrate legacy single session into pool slot 0
+    if not idxs:
+        legacy = r.get("relay:master_session") or os.getenv("SESSION_STRING", "")
+        if legacy:
+            r.sadd("relay:pool", "0")
+            r.set("relay:pool:0", legacy)
+            idxs = ["0"]
+            logger.info("Migrated master session to pool slot 0")
+    for idx in idxs:
+        if idx in _pool_ready:
+            continue
+        ss = r.get(f"relay:pool:{idx}")
+        if not ss:
+            continue
+        try:
+            client = Client(f"pool_{idx}", api_id=config.API_ID,
+                            api_hash=config.API_HASH, session_string=ss)
+            await client.start()
+            me = await client.get_me()
+            logger.info(f"Pool[{idx}]: @{me.username} (id={me.id})")
+            _pool[idx] = client
+            _pool_ready.add(idx)
+            if idx not in _pool_handlers:
+                _pool_handlers.add(idx)
+                bots = get_bots()
+                names = [b.strip("@").lower() for b in bots]
+
+                def make_handlers(pi):
+                    @client.on_message(filters.chat(names) if names else filters.private)
+                    async def on_msg(c, m: Message):
+                        await route_pool_message(pi, m)
+
+                    @client.on_edited_message(filters.chat(names) if names else filters.private)
+                    async def on_edit(c, m: Message):
+                        await route_pool_message(pi, m, edited=True)
+                make_handlers(idx)
+        except Exception as e:
+            logger.error(f"Pool[{idx}] failed: {e}")
+    # Compat: userbot = first pool client
+    if _pool_ready:
+        first = sorted(_pool_ready, key=int)[0]
+        userbot = _pool[first]
         userbot_ready = True
-        if not _handlers_done:
-            _handlers_done = True
-            bots = get_bots()
-            names = [b.strip("@").lower() for b in bots]
+    else:
+        logger.info("Pool empty — relay disabled")
 
-            @userbot.on_message(filters.chat(names) if names else filters.private)
-            async def on_msg(c, m: Message):
-                await route_bot_message(m)
 
-            @userbot.on_edited_message(filters.chat(names) if names else filters.private)
-            async def on_edit(c, m: Message):
-                await route_bot_message(m, edited=True)
-    except Exception as e:
-        logger.error(f"Master userbot failed: {e}")
-        userbot_ready = False
+async def get_pool_client(web_session: str):
+    """Get (or assign) a pool account for a web user. Sticky assignment."""
+    r = get_redis()
+    if not _pool_ready:
+        await init_pool()
+    if not _pool_ready:
+        return None, None
+    # Existing assignment?
+    idx = r.get(f"relay:pool:assign:{web_session}")
+    if idx and idx in _pool_ready:
+        r.expire(f"relay:pool:assign:{web_session}", 1800)  # 30 min sticky
+        return _pool[idx], idx
+    # Find a free account
+    assigned = set()
+    for k in r.scan_iter("relay:pool:assign:*"):
+        a = r.get(k)
+        if a:
+            assigned.add(a)
+    free = [i for i in sorted(_pool_ready, key=int) if i not in assigned]
+    if free:
+        idx = free[0]
+    else:
+        # All busy — share the least-recently-used (fallback to pool[0])
+        idx = sorted(_pool_ready, key=int)[0]
+    r.setex(f"relay:pool:assign:{web_session}", 1800, idx)
+    # Map pool account -> web session for routing replies
+    r.setex(f"relay:pool:owner:{idx}", 1800, web_session)
+    logger.info(f"[Pool] {web_session[:8]} -> account[{idx}]")
+    return _pool[idx], idx
+
+
+async def route_pool_message(pool_idx: str, message: Message, edited: bool = False):
+    """Route a reply from a pool account to its assigned web user."""
+    r = get_redis()
+    web_session = r.get(f"relay:pool:owner:{pool_idx}")
+    if not web_session:
+        # No owner — try pending queue fallback
+        bkey = bot_key(message.chat.username or str(message.chat.id))
+        web_session = r.lpop(f"route:pending:{bkey}") or "_orphan"
+    # Temporarily set lock so route_bot_message delivers to the right user
+    bkey = bot_key(message.chat.username or str(message.chat.id))
+    if not edited:
+        # Push to front of pending so route_bot_message picks this user
+        r.lpush(f"route:pending:{bkey}", web_session)
+    # Refresh owner TTL on activity
+    r.expire(f"relay:pool:owner:{pool_idx}", 1800)
+    r.expire(f"relay:pool:assign:{web_session}", 1800)
+    await route_bot_message(message, edited=edited)
+
+
+# Legacy single-userbot init (kept for compat, delegates to pool)
+async def init_userbot():
+    await init_pool()
 
 
 async def route_bot_message(message: Message, edited: bool = False):
@@ -241,12 +311,13 @@ _pending = {}
 
 @web.post("/api/admin/phone")
 async def admin_phone(phone: str = Form(...)):
+    """Admin: add a Telegram account to the pool (step 1: send OTP)."""
     try:
         tmp = Client("admin_auth", api_id=config.API_ID, api_hash=config.API_HASH, workdir="/tmp")
         await tmp.connect()
         sent = await tmp.send_code(phone.strip())
         _pending["admin"] = {"client": tmp, "phone": phone.strip(), "hash": sent.phone_code_hash}
-        logger.info("Admin OTP sent")
+        logger.info(f"Admin OTP sent to {phone.strip()}")
         return RedirectResponse(url="/?otp=sent", status_code=303)
     except Exception as e:
         return RedirectResponse(url="/?err=" + str(e)[:100], status_code=303)
@@ -254,6 +325,7 @@ async def admin_phone(phone: str = Form(...)):
 
 @web.post("/api/admin/verify")
 async def admin_verify(code: str = Form(...)):
+    """Admin: verify OTP and ADD this account to the pool."""
     p = _pending.get("admin")
     if not p:
         return RedirectResponse(url="/?err=no_auth", status_code=303)
@@ -261,17 +333,56 @@ async def admin_verify(code: str = Form(...)):
         tmp = p["client"]
         await tmp.sign_in(p["phone"], p["hash"], code.strip())
         ss = await tmp.export_session_string()
+        me = await tmp.get_me()
         await tmp.disconnect()
         _pending.pop("admin", None)
-        os.environ["SESSION_STRING"] = ss
-        get_redis().set("relay:master_session", ss)  # persistent, no repeated login
-        logger.info("Master session saved (persistent)")
-        await init_userbot()
-        if userbot_ready:
-            return RedirectResponse(url="/?ok=connected", status_code=303)
-        return RedirectResponse(url="/?err=relay_failed", status_code=303)
+        r = get_redis()
+        # Find next free pool slot
+        idx = 0
+        existing = r.smembers("relay:pool")
+        while str(idx) in existing:
+            idx += 1
+        r.sadd("relay:pool", str(idx))
+        r.set(f"relay:pool:{idx}", ss)
+        r.set(f"relay:pool:{idx}:phone", p["phone"])
+        r.set(f"relay:pool:{idx}:name", f"@{me.username}" if me.username else str(me.id))
+        logger.info(f"Pool account [{idx}] added: {p['phone']}")
+        await init_pool()
+        return RedirectResponse(url=f"/?ok=account_added_{idx}", status_code=303)
     except Exception as e:
         return RedirectResponse(url="/?err=" + str(e)[:100], status_code=303)
+
+
+@web.post("/api/admin/pool/remove")
+async def admin_pool_remove(idx: str = Form(...)):
+    """Remove a pool account."""
+    r = get_redis()
+    r.srem("relay:pool", idx)
+    r.delete(f"relay:pool:{idx}", f"relay:pool:{idx}:phone", f"relay:pool:{idx}:name")
+    c = _pool.pop(idx, None)
+    _pool_ready.discard(idx)
+    _pool_handlers.discard(idx)
+    if c:
+        try:
+            await c.stop()
+        except Exception:
+            pass
+    return RedirectResponse(url="/", status_code=303)
+
+
+@web.get("/api/admin/pool/list")
+async def admin_pool_list():
+    """List pool accounts."""
+    r = get_redis()
+    out = []
+    for idx in sorted(r.smembers("relay:pool"), key=int):
+        out.append({
+            "idx": idx,
+            "phone": r.get(f"relay:pool:{idx}:phone") or "?",
+            "name": r.get(f"relay:pool:{idx}:name") or "?",
+            "connected": idx in _pool_ready,
+        })
+    return JSONResponse({"ok": True, "pool": out, "size": len(out)})
 
 
 # ------------------------------------------------------------ Chat API ------
@@ -282,44 +393,31 @@ async def chat_bots():
 
 @web.post("/api/chat/send")
 async def chat_send(session_id: str = Form(...), bot: str = Form(...), text: str = Form(...)):
-    if not userbot_ready or not userbot:
-        return JSONResponse({"ok": False, "error": "Relay offline — admin setup needed."}, status_code=503)
     target = norm_bot(bot)
     if target not in get_bots():
         return JSONResponse({"ok": False, "error": "Bot not available."}, status_code=400)
+    # Get this user's dedicated pool account
+    client, pool_idx = await get_pool_client(session_id)
+    if not client:
+        return JSONResponse({"ok": False, "error": "Relay offline — admin setup needed."}, status_code=503)
     try:
         r = get_redis()
         bkey = bot_key(target)
         hkey = f"chat:history:{session_id}:{bkey}"
         t = text[:500]
-        LOCK_TTL = 120
-        # --- Conversation lock: one user talks to the bot at a time ---
-        lock_holder = r.get(f"lock:{bkey}")
-        if lock_holder and lock_holder != session_id:
-            # Bot is busy with another user — queue this message
-            r.rpush(f"queue:{bkey}", json.dumps({
-                "session": session_id, "text": t, "ts": time.time()}))
-            r.rpush(hkey, json.dumps({"from": "user", "text": t, "ts": time.time(), "queued": True}))
-            r.ltrim(hkey, -200, -1)
-            qpos = r.llen(f"queue:{bkey}")
-            logger.info(f"[Queue:{session_id[:8]}] @{bkey} busy, queued at #{qpos}")
-            return JSONResponse({"ok": True, "queued": True,
-                                 "message": f"Bot is busy with another user. You are #{qpos} in queue."})
-        # Acquire/refresh lock
-        r.setex(f"lock:{bkey}", LOCK_TTL, session_id)
         # Auto /start so default/welcome messages show
         if r.llen(hkey) == 0 and not t.strip().startswith("/"):
-            await userbot.send_message(target, "/start")
+            await client.send_message(target, "/start")
             r.rpush(hkey, json.dumps({"from": "user", "text": "/start", "ts": time.time()}))
-            r.rpush(f"route:pending:{bkey}", session_id)
             await asyncio.sleep(1)
         r.rpush(hkey, json.dumps({"from": "user", "text": t, "ts": time.time()}))
         r.ltrim(hkey, -200, -1)
+        # Mark awaiting reply (fallback routing)
         r.rpush(f"route:pending:{bkey}", session_id)
         r.expire(f"route:pending:{bkey}", 300)
-        await userbot.send_message(target, t)
-        logger.info(f"[Send:{session_id[:8]}] -> {target}: {t[:40]}")
-        return JSONResponse({"ok": True})
+        await client.send_message(target, t)
+        logger.info(f"[Send:{session_id[:8]} via pool[{pool_idx}]] -> {target}: {t[:40]}")
+        return JSONResponse({"ok": True, "pool": pool_idx})
     except Exception as e:
         logger.error(f"Send failed: {e}")
         return JSONResponse({"ok": False, "error": str(e)[:200]}, status_code=500)
@@ -373,7 +471,8 @@ async def chat_messages(session_id: str = Query(""), bot: str = Query(""), since
 
 @web.post("/api/chat/callback")
 async def chat_callback(session_id: str = Form(...), cb_id: str = Form(...)):
-    if not userbot_ready or not userbot:
+    client, pool_idx = await get_pool_client(session_id)
+    if not client:
         return JSONResponse({"ok": False, "error": "Relay offline."}, status_code=503)
     try:
         r = get_redis()
@@ -383,14 +482,12 @@ async def chat_callback(session_id: str = Form(...), cb_id: str = Form(...)):
         cb = json.loads(cj)
         if cb.get("session") != session_id:
             return JSONResponse({"ok": False, "error": "Not yours."}, status_code=403)
-        await userbot.request_callback_answer(
+        await client.request_callback_answer(
             chat_id=cb["chat_id"], message_id=cb["msg_id"], callback_data=cb["data"])
-        # Route the click's reply to the clicker: acquire lock + pending
         bkey = cb.get("bkey", "")
         if bkey:
-            r.setex(f"lock:{bkey}", 120, session_id)
             r.rpush(f"route:pending:{bkey}", session_id)
-        logger.info(f"[Click:{session_id[:8]}] {cb['data'][:40]}")
+        logger.info(f"[Click:{session_id[:8]} via pool[{pool_idx}]] {cb['data'][:40]}")
         return JSONResponse({"ok": True})
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)[:200]}, status_code=500)
@@ -398,28 +495,27 @@ async def chat_callback(session_id: str = Form(...), cb_id: str = Form(...)):
 
 @web.get("/api/chat/commands")
 async def chat_commands(bot: str = Query("")):
-    if not userbot_ready or not userbot:
-        return JSONResponse({"ok": True, "commands": []})
     bkey = bot_key(bot)
-    # 1. Custom admin-configured commands first
     try:
         custom = get_redis().get(f"relay:cmds_custom:{bkey}")
         if custom:
             return JSONResponse({"ok": True, "commands": json.loads(custom), "source": "custom"})
     except Exception:
         pass
-    # 2. Auto-fetch from Telegram
+    if not _pool_ready:
+        return JSONResponse({"ok": True, "commands": []})
     try:
         from pyrogram import raw
+        client = _pool[sorted(_pool_ready, key=int)[0]]
         target = norm_bot(bot)
-        peer = await userbot.resolve_peer(target)
-        result = await userbot.invoke(raw.functions.bots.GetBotCommands(bot=peer))
+        peer = await client.resolve_peer(target)
+        result = await client.invoke(raw.functions.bots.GetBotCommands(bot=peer))
         cmds = [{"command": c.command, "description": c.description} for c in result]
         if cmds:
             get_redis().setex(f"relay:cmds:{bkey}", 3600, json.dumps(cmds))
             return JSONResponse({"ok": True, "commands": cmds, "source": "auto"})
     except Exception as e:
-        logger.warning(f"GetBotCommands failed for {bot}: {e}")
+        logger.warning(f"GetBotCommands failed: {e}")
     try:
         cached = get_redis().get(f"relay:cmds:{bkey}")
         if cached:
@@ -432,9 +528,10 @@ async def chat_commands(bot: str = Query("")):
 @web.post("/api/admin/bots/discover")
 async def admin_discover_commands(bot_username: str = Form(...)):
     """Auto-discover a bot's real commands by sending /help and /start, parsing responses."""
-    if not userbot_ready or not userbot:
+    if not _pool_ready:
         return JSONResponse({"ok": False, "error": "Relay offline."}, status_code=503)
     import re
+    client = _pool[sorted(_pool_ready, key=int)[0]]
     target = norm_bot(bot_username)
     bkey = bot_key(target)
     # Use a dedicated discovery session so routing doesn't mix with users
@@ -447,7 +544,7 @@ async def admin_discover_commands(bot_username: str = Form(...)):
         # Send /start and /help, collect responses
         for cmd in ["/start", "/help"]:
             r.rpush(f"route:pending:{bkey}", disc_sid)
-            await userbot.send_message(target, cmd)
+            await client.send_message(target, cmd)
             await asyncio.sleep(3)  # wait for reply
         # Read what came back
         msgs = r.lrange(f"chat:history:{disc_sid}:{bkey}", 0, -1)
@@ -570,13 +667,15 @@ async def admin_remove_bot(bot_username: str = Form(...)):
 @web.get("/", response_class=HTMLResponse)
 async def dashboard(ok: str = "", otp: str = "", err: str = ""):
     banner = ""
-    if ok == "connected":
-        banner = '<div style="background:#1a4d1a;padding:15px;border-radius:8px;margin-bottom:15px;border:1px solid #2d7a2d;">✅ Master userbot connected! Relay live.</div>'
+    if ok.startswith("account_added"):
+        banner = '<div style="background:#1a4d1a;padding:15px;border-radius:8px;margin-bottom:15px;border:1px solid #2d7a2d;">✅ Telegram account added to pool!</div>'
+    elif ok == "connected":
+        banner = '<div style="background:#1a4d1a;padding:15px;border-radius:8px;margin-bottom:15px;border:1px solid #2d7a2d;">✅ Connected!</div>'
     elif otp == "sent":
         banner = '<div style="background:#1a3a4d;padding:15px;border-radius:8px;margin-bottom:15px;border:1px solid #2d6a7a;">📩 OTP sent! Enter the code below.</div>'
     elif err:
         banner = f'<div style="background:#4d1a1a;padding:15px;border-radius:8px;margin-bottom:15px;border:1px solid #7a2d2d;">❌ {err}</div>'
-    relay = "🟢 Connected" if userbot_ready else "🔴 Not connected"
+    relay = f"🟢 {len(_pool_ready)} accounts" if _pool_ready else "🔴 Not connected"
     bots = get_bots()
     bots_html = "".join(
         f'<li>{b} <form action="/api/admin/bots/remove" method="post" style="display:inline">'
@@ -585,31 +684,31 @@ async def dashboard(ok: str = "", otp: str = "", err: str = ""):
         for b in bots)
     return f"""
     <!DOCTYPE html><html lang="bn"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>Master Relay Dashboard</title>
+    <title>Pool Relay Dashboard</title>
     <style>
         body {{ font-family: Arial; background: #0f0f0f; color: #fff; padding: 20px; max-width: 500px; margin: auto; }}
         h1 {{ color: #d4af37; }} .card {{ background: #1a1a1a; padding: 15px; border-radius: 8px; margin: 10px 0; }}
-        input, button {{ width: 100%; padding: 12px; margin: 8px 0; border-radius: 8px; border: 1px solid #333; font-size: 16px; box-sizing: border-box; }}
-        input {{ background: #222; color: #fff; }} button {{ background: #d4af37; color: #000; font-weight: bold; border: none; cursor: pointer; }}
+        input, button, select {{ width: 100%; padding: 12px; margin: 8px 0; border-radius: 8px; border: 1px solid #333; font-size: 16px; box-sizing: border-box; }}
+        input, select {{ background: #222; color: #fff; }} button {{ background: #d4af37; color: #000; font-weight: bold; border: none; cursor: pointer; }}
         a {{ color: #d4af37; }} ul {{ padding-left: 20px; }} li {{ margin: 6px 0; }}
     </style></head>
     <body>
-        <h1>🤖 Master Relay</h1>{banner}
-        <div class="card"><b>Relay:</b> {relay}</div>
-        <div class="card"><h3>🔑 Admin Login (one time)</h3>
+        <h1>🤖 Account Pool Relay</h1>{banner}
+        <div class="card"><b>Relay:</b> {relay}<div id="poollist"></div></div>
+        <div class="card"><h3>📱 Add Telegram Account (4-5 টা দাও!)</h3>
             <form action="/api/admin/phone" method="post">
                 <input name="phone" placeholder="+8801XXXXXXXXX" required>
                 <button type="submit">Send OTP</button></form>
             <form action="/api/admin/verify" method="post">
                 <input name="code" placeholder="OTP Code" required>
-                <button type="submit">Verify & Connect</button></form></div>
+                <button type="submit">Verify & Add to Pool</button></form></div>
         <div class="card"><h3>🤖 Bots</h3><ul>{bots_html}</ul>
             <form action="/api/admin/bots/add" method="post">
                 <input name="bot_username" placeholder="@BotUsername" required>
                 <button type="submit">➕ Add Bot</button></form></div>
         <div class="card"><h3>📋 Bot Commands Manager</h3>
             <p style="font-size:13px;color:#888;">Bot select করো, commands দেখো, add/delete করো (সর্বোচ্চ ১০টি)!</p>
-            <select id="cmdbot" style="width:100%;padding:12px;margin:8px 0;border-radius:8px;border:1px solid #333;background:#222;color:#fff;font-size:16px;">
+            <select id="cmdbot">
                 <option value="">-- Bot select করো --</option>
             </select>
             <div id="cmdlist" style="margin:10px 0;"></div>
@@ -621,7 +720,18 @@ async def dashboard(ok: str = "", otp: str = "", err: str = ""):
             <button onclick="discoverCmd()" style="background:#2a4d2a;margin-top:6px;">🔍 Auto-Discover</button>
             <p id="cmdmsg" style="font-size:13px;color:#d4af37;"></p>
         </div>
+        <div class="card"><a href="/chat">💬 Open Live Chat →</a></div>
+        <div class="card"><a href="/api/status">📊 Status</a></div>
         <script>
+        fetch('/api/admin/pool/list').then(r=>r.json()).then(d=>{{
+            const div = document.getElementById('poollist');
+            div.innerHTML = '<ul>' + (d.pool||[]).map(p=>
+                '<li>['+p.idx+'] '+p.phone+' ('+p.name+') '+(p.connected?'🟢':'🔴')+
+                ' <form action="/api/admin/pool/remove" method="post" style="display:inline">'+
+                '<input type="hidden" name="idx" value="'+p.idx+'">'+
+                '<button type="submit" style="width:auto;padding:4px 10px;">✕</button></form></li>'
+            ).join('') + '</ul>';
+        }});
         async function loadCmdBots() {{
             const d = await fetch('/api/chat/bots').then(r=>r.json());
             const sel = document.getElementById('cmdbot');
@@ -678,8 +788,6 @@ async def dashboard(ok: str = "", otp: str = "", err: str = ""):
         document.getElementById('cmdbot').addEventListener('change', loadCmdList);
         loadCmdBots();
         </script>
-        <div class="card"><a href="/chat">💬 Open Live Chat →</a></div>
-        <div class="card"><a href="/api/status">📊 Status</a></div>
     </body></html>
     """
 
@@ -834,7 +942,7 @@ async def system_status():
         redis_ok = f"error: {e}"
     return {
         "status": "running", "bot": config.BOT_USERNAME, "redis": redis_ok,
-        "master_relay": "running" if userbot_ready else "disabled",
+        "pool_size": len(_pool_ready), "pool_total": pool_size(),
         "bots": get_bots(),
     }
 
