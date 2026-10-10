@@ -126,6 +126,57 @@ bot = Client(
     bot_token=_bot_token or None,
 )
 
+# --- Bot API fallback poller (Pyrogram MTProto sometimes misses bot updates) ---
+import aiohttp
+
+_bot_api_token = _bot_token
+_poller_offset = 0
+
+
+async def bot_api_send(chat_id: int, text: str):
+    """Send a message via Bot API."""
+    async with aiohttp.ClientSession() as s:
+        async with s.post(
+            f"https://api.telegram.org/bot{_bot_api_token}/sendMessage",
+            json={"chat_id": chat_id, "text": text},
+        ) as r:
+            return await r.json()
+
+
+async def bot_api_poller():
+    """Long-poll Bot API getUpdates as a reliable fallback for incoming messages."""
+    global _poller_offset
+    if not _bot_api_token:
+        logger.info("No bot token — skipping Bot API poller")
+        return
+    logger.info("Starting Bot API poller fallback...")
+    async with aiohttp.ClientSession() as s:
+        while True:
+            try:
+                async with s.get(
+                    f"https://api.telegram.org/bot{_bot_api_token}/getUpdates",
+                    params={"offset": _poller_offset, "timeout": 30},
+                ) as r:
+                    data = await r.json()
+                for upd in data.get("result", []):
+                    _poller_offset = upd["update_id"] + 1
+                    msg = upd.get("message", {})
+                    text = msg.get("text", "")
+                    chat_id = msg.get("chat", {}).get("id")
+                    user = msg.get("from", {})
+                    if not text or not chat_id:
+                        continue
+                    logger.info(f"[BotAPI] Message from {user.get('id')} (@{user.get('username')}): {text[:50]}")
+                    if text.startswith("/start"):
+                        await bot_api_send(chat_id, f"👋 Hello! I'm @mlazone_bot\n\nSend me any message and I'll echo it back.\nUse the dashboard to submit OTPs.")
+                    else:
+                        await bot_api_send(chat_id, f"Received: {text[:100]}")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning(f"Bot API poller error: {e}")
+                await asyncio.sleep(5)
+
 
 @bot.on_message(filters.private & filters.text)
 async def handle_private_message(client: Client, message: Message):
@@ -154,6 +205,8 @@ async def main():
     await bot.start()
     me = await bot.get_me()
     logger.info(f"Logged in as @{me.username} (id={me.id}, is_bot={me.is_bot})")
+    # Start Bot API poller as fallback for incoming messages
+    poller_task = asyncio.create_task(bot_api_poller())
     logger.info("Userbot connected! Starting web server...")
     server = uvicorn.Server(
         uvicorn.Config(

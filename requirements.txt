@@ -5,3 +5,4 @@ tgcrypto
 redis
 python-multipart
 pydantic
+aiohttp
