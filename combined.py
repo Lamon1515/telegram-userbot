@@ -195,7 +195,9 @@ async def route_pool_message(pool_idx: str, message: Message, edited: bool = Fal
     # Temporarily set lock so route_bot_message delivers to the right user
     bkey = bot_key(message.chat.username or str(message.chat.id))
     if not edited:
-        # Push to front of pending so route_bot_message picks this user
+        # Mark as awaiting with timestamp (primary) + legacy pending queue
+        if web_session and web_session != "_orphan":
+            r.setex(f"route:awaiting:{bkey}:{web_session}", 300, str(time.time()))
         r.lpush(f"route:pending:{bkey}", web_session)
     # Refresh owner TTL on activity
     r.expire(f"relay:pool:owner:{pool_idx}", 1800)
@@ -225,6 +227,7 @@ async def route_bot_message(message: Message, edited: bool = False):
                 if getattr(btn, "callback_data", None):
                     # cb_id assigned per-session later; store template
                     b["cb_data"] = btn.callback_data
+                    brow.append(b)
                 elif getattr(btn, "url", None):
                     b["url"] = btn.url
                     brow.append(b)
@@ -247,20 +250,46 @@ async def route_bot_message(message: Message, edited: bool = False):
                     r.lset(skey, i, json.dumps(m))
                     logger.info(f"[Route] Edit -> {skey}")
                     return
-        return
+        # Edit target not found in any history (e.g., original went to orphan).
+        # Fall through and deliver as a new message so the user still sees it.
+        logger.info(f"[Route] Edit target {mid} not found, delivering as new")
+        is_edit_fallback = True
+    else:
+        is_edit_fallback = False
 
     # --- dedup ---
-    if r.exists(f"route:seen:{bkey}:{mid}"):
+    # For edit-fallbacks, use a separate key so the original's seen-flag doesn't block
+    dedup_key = f"route:seen:{bkey}:{mid}:editfb" if (edited and is_edit_fallback) else f"route:seen:{bkey}:{mid}"
+    if r.exists(dedup_key):
         return
-    r.setex(f"route:seen:{bkey}:{mid}", 86400, "1")
+    r.setex(dedup_key, 86400, "1")
 
-    # --- find target session: lock holder first, then pending queue ---
+    # --- find target session: most-recently-active awaiting user ---
+    # Check lock holder first (active conversation)
     LOCK_TTL = 120
     target_sid = r.get(f"lock:{bkey}")
     if target_sid:
-        r.expire(f"lock:{bkey}", LOCK_TTL)  # refresh on activity
+        r.expire(f"lock:{bkey}", LOCK_TTL)
     else:
-        target_sid = r.lpop(f"route:pending:{bkey}")
+        # Find the session with the most recent awaiting-response timestamp
+        # This handles multi-user: the user who most recently sent/clicked gets the reply
+        best_sid = None
+        best_ts = 0
+        for akey in r.scan_iter(f"route:awaiting:{bkey}:*"):
+            try:
+                ts = float(r.get(akey) or 0)
+                if ts > best_ts:
+                    best_ts = ts
+                    # akey format: route:awaiting:{bkey}:{session_id}
+                    best_sid = akey.split(":", 3)[3]
+            except:
+                pass
+        if best_sid:
+            target_sid = best_sid
+            r.delete(f"route:awaiting:{bkey}:{best_sid}")
+        else:
+            # Fallback to legacy pending queue
+            target_sid = r.lpop(f"route:pending:{bkey}")
     if not target_sid:
         logger.info(f"[Route] No pending user for @{bkey}, storing in orphan")
         target_sid = "_orphan"
@@ -412,7 +441,9 @@ async def chat_send(session_id: str = Form(...), bot: str = Form(...), text: str
             await asyncio.sleep(1)
         r.rpush(hkey, json.dumps({"from": "user", "text": t, "ts": time.time()}))
         r.ltrim(hkey, -200, -1)
-        # Mark awaiting reply (fallback routing)
+        # Mark awaiting reply with timestamp (primary routing)
+        # Also keep legacy pending queue as fallback
+        r.setex(f"route:awaiting:{bkey}:{session_id}", 300, str(time.time()))
         r.rpush(f"route:pending:{bkey}", session_id)
         r.expire(f"route:pending:{bkey}", 300)
         await client.send_message(target, t)
@@ -486,6 +517,7 @@ async def chat_callback(session_id: str = Form(...), cb_id: str = Form(...)):
             chat_id=cb["chat_id"], message_id=cb["msg_id"], callback_data=cb["data"])
         bkey = cb.get("bkey", "")
         if bkey:
+            r.setex(f"route:awaiting:{bkey}:{session_id}", 300, str(time.time()))
             r.rpush(f"route:pending:{bkey}", session_id)
         logger.info(f"[Click:{session_id[:8]} via pool[{pool_idx}]] {cb['data'][:40]}")
         return JSONResponse({"ok": True})
